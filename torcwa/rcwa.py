@@ -4,6 +4,25 @@ from .torch_eig import Eig
 
 pi = 3.141592652589793
 
+# kygwow patch constants/helpers ------------------------------------------
+_KT_ZERO_TOL = 1e-12
+
+
+def _warn_nonfinite(S):
+    """Warn when non-finite S-parameters are about to be replaced by 0.
+
+    A non-finite value usually means an order sits exactly on a Rayleigh
+    anomaly (k_z = 0); the zero that replaces it is not a physical answer.
+    """
+    if bool(torch.any(~torch.isfinite(S))):
+        warnings.warn(
+            "torcwa: non-finite S-parameters replaced by 0 (an order is likely on a Rayleigh anomaly); "
+            "the returned zero is not a physical result",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 class rcwa:
     # Simulation setting
     def __init__(self,freq,order,L,*,
@@ -402,6 +421,7 @@ class rcwa:
             elif direction == 'backward' and port == 'transmission':
                 S = self.S[3][order_indices,ref_order_index] * normalization
 
+            _warn_nonfinite(S)
             S = torch.where(torch.isinf(S),torch.zeros_like(S),S)
             S = torch.where(torch.isnan(S),torch.zeros_like(S),S)
 
@@ -438,6 +458,11 @@ class rcwa:
 
             order_inc_angle = torch.atan2(torch.real(order_Kt_norm_dn),order_Kz_norm_dn)
             order_azi_angle = torch.atan2(torch.real(order_Ky_norm_dn),torch.real(order_Kx_norm_dn))
+            # kygwow patch: at k_parallel = 0 the azimuth is undefined by the
+            # k-vector; use the azimuth given to set_incident_angle so exact
+            # normal incidence keeps the requested p/s basis (continuous with
+            # the theta -> 0+ limit) instead of silently using azimuth 0.
+            order_azi_angle = torch.where(torch.real(order_Kt_norm_dn) < _KT_ZERO_TOL, torch.real(self.azi_ang)*torch.ones_like(order_azi_angle), order_azi_angle)
 
             ref_Kx_norm_dn = self.Kx_norm_dn[ref_order_index]
             ref_Ky_norm_dn = self.Ky_norm_dn[ref_order_index]
@@ -448,6 +473,8 @@ class rcwa:
 
             ref_inc_angle = torch.atan2(torch.real(ref_Kt_norm_dn),ref_Kz_norm_dn)
             ref_azi_angle = torch.atan2(torch.real(ref_Ky_norm_dn),torch.real(ref_Kx_norm_dn))
+            if torch.real(ref_Kt_norm_dn) < _KT_ZERO_TOL:
+                ref_azi_angle = torch.real(self.azi_ang)
 
             xx = self.S[idx][order_indices,ref_order_index]
             xy = self.S[idx][order_indices,ref_order_index+self.order_N]
@@ -515,6 +542,7 @@ class rcwa:
             else:
                 normalization = 1.
 
+            _warn_nonfinite(S)
             S = torch.where(torch.isinf(S),torch.zeros_like(S),S)
             S = torch.where(torch.isnan(S),torch.zeros_like(S),S)
 
