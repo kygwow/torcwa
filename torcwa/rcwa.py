@@ -162,7 +162,7 @@ class rcwa:
 
         self._kvectors()
 
-    def add_layer(self,thickness,eps=1.,mu=1.):
+    def add_layer(self,thickness,eps=1.,mu=1.,factorization='laurent'):
         '''
             Add internal layer
 
@@ -170,7 +170,16 @@ class rcwa:
             - thickness: layer thickness (unit: length)
             - eps: relative permittivity
             - mu: relative permeability
+            - factorization: 'laurent' (default, upstream behavior), 'li_x' or 'li_y'
+                (kygwow patch) Li's inverse rule for the tangential E component normal to the walls
+                of a 1-D grating: 'li_x' for eps varying along x only (lines along y), 'li_y' for eps
+                varying along y only. The block of Q acting on that component uses inv([[1/eps]]);
+                the other component and the E_z term keep Laurent's rule. Homogeneous layers are
+                unaffected. 2-D patterns need the normal-vector method and are rejected.
         '''
+
+        if factorization not in ('laurent','li_x','li_y'):
+            raise ValueError(f"factorization must be 'laurent', 'li_x' or 'li_y', got {factorization!r}")
 
         is_eps_homogenous = (type(eps) == float) or (type(eps) == complex) or (eps.dim() == 0) or ((eps.dim() == 1) and eps.shape[0] == 1)
         is_mu_homogenous = (type(mu) == float) or (type(mu) == complex) or (mu.dim() == 0) or ((mu.dim() == 1) and mu.shape[0] == 1)
@@ -178,13 +187,17 @@ class rcwa:
         self.eps_conv.append(eps*torch.eye(self.order_N,dtype=self._dtype,device=self._device) if is_eps_homogenous else self._material_conv(eps))
         self.mu_conv.append(mu*torch.eye(self.order_N,dtype=self._dtype,device=self._device) if is_mu_homogenous else self._material_conv(mu))
 
+        eps_li = None
+        if factorization != 'laurent' and not is_eps_homogenous:
+            eps_li = self._li_inverse_conv(eps,factorization)
+
         self.layer_N += 1
         self.thickness.append(thickness)
 
         if is_eps_homogenous and is_mu_homogenous:
             self._eigen_decomposition_homogenous(eps,mu)
         else:
-            self._eigen_decomposition()
+            self._eigen_decomposition(eps_li,factorization)
 
         self._solve_layer_smatrix()
 
@@ -1231,6 +1244,19 @@ class rcwa:
         
         return material_convmat
     
+    def _li_inverse_conv(self,eps,factorization):
+        # kygwow patch: inv([[1/eps]]) for Li's inverse rule on a 1-D grating
+        if eps.dim() != 2:
+            raise ValueError('Li factorization needs a 2-D eps grid [nx, ny]')
+        if factorization == 'li_x':
+            invariant = torch.allclose(eps, eps[:, :1].expand_as(eps))
+        else:
+            invariant = torch.allclose(eps, eps[:1, :].expand_as(eps))
+        if not invariant:
+            raise ValueError(f"factorization={factorization!r} needs eps varying along "
+                             f"{'x' if factorization == 'li_x' else 'y'} only; 2-D patterns need the normal-vector method")
+        return torch.linalg.inv(self._material_conv(1.0/eps))
+
     def _eigen_decomposition_homogenous(self,eps,mu):
         # H to E transformation matirx
         self.P.append(torch.hstack((torch.vstack((torch.zeros_like(self.mu_conv[-1]),-self.mu_conv[-1])),
@@ -1249,15 +1275,18 @@ class rcwa:
         self.kz_norm.append(kz_norm) 
         self.E_eigvec.append(E_eigvec)
 
-    def _eigen_decomposition(self):
+    def _eigen_decomposition(self,eps_li=None,factorization='laurent'):
         # H to E transformation matirx
         P_tmp = torch.matmul(torch.vstack((self.Kx_norm,self.Ky_norm)), torch.linalg.inv(self.eps_conv[-1]))
         self.P.append(torch.hstack((torch.vstack((torch.zeros_like(self.mu_conv[-1]),-self.mu_conv[-1])),
             torch.vstack((self.mu_conv[-1],torch.zeros_like(self.mu_conv[-1]))))) + torch.matmul(P_tmp, torch.hstack((self.Ky_norm,-self.Kx_norm))))
-        # E to H transformation matrix
+        # E to H transformation matrix; columns act on (E_x, E_y). kygwow patch: Li's rule on the
+        # component normal to the walls (E_x column for 'li_x', E_y column for 'li_y').
+        eps_x = eps_li if (eps_li is not None and factorization == 'li_x') else self.eps_conv[-1]
+        eps_y = eps_li if (eps_li is not None and factorization == 'li_y') else self.eps_conv[-1]
         Q_tmp = torch.matmul(torch.vstack((self.Kx_norm,self.Ky_norm)), torch.linalg.inv(self.mu_conv[-1]))
-        self.Q.append(torch.hstack((torch.vstack((torch.zeros_like(self.eps_conv[-1]),self.eps_conv[-1])),
-            torch.vstack((-self.eps_conv[-1],torch.zeros_like(self.eps_conv[-1]))))) + torch.matmul(Q_tmp, torch.hstack((-self.Ky_norm,self.Kx_norm))))
+        self.Q.append(torch.hstack((torch.vstack((torch.zeros_like(eps_x),eps_x)),
+            torch.vstack((-eps_y,torch.zeros_like(eps_y))))) + torch.matmul(Q_tmp, torch.hstack((-self.Ky_norm,self.Kx_norm))))
         
         # Eigen-decomposition
         if self.stable_eig_grad is True:
