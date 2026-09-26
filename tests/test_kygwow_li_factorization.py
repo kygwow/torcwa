@@ -95,13 +95,40 @@ def test_lossless_energy_is_conserved(theta_deg, azimuth_deg):
         assert abs(total - 1.0) < 1e-8
 
 
-@pytest.mark.parametrize("code_x,code_y", [("pp", "pp"), ("ss", "ss"), ("ps", "ps")])
-def test_li_y_is_li_x_rotated(code_x, code_y):
-    # Rotating the structure by 90 degrees and the incidence azimuth with it must give the same p/s response.
+@pytest.mark.parametrize("code", CODES)
+def test_li_y_is_li_x_rotated(code):
+    # Rotating the structure and the incidence azimuth by 90 degrees leaves the p/s response unchanged,
+    # including phase (the p/s basis is tied to the plane of incidence).
     th, az = math.radians(12), math.radians(20)
-    a = _r00(_solve(_eps_lines("x"), [15, 0], th, az, factorization="li_x"), code_x)
-    b = _r00(_solve(_eps_lines("y"), [0, 15], th, az + math.pi / 2, factorization="li_y"), code_y)
-    assert abs(abs(a) - abs(b)) < 1e-9
+    a = _r00(_solve(_eps_lines("x"), [15, 0], th, az, factorization="li_x"), code)
+    b = _r00(_solve(_eps_lines("y"), [0, 15], th, az + math.pi / 2, factorization="li_y"), code)
+    assert abs(a - b) < 1e-10
+
+
+def _reflectance_pp(n_line, thickness, factorization):
+    x = torch.linspace(-0.5, 0.5, 257, dtype=torch.float64)[:-1]
+    fill = (torch.abs(x) < 0.25).to(torch.complex128)
+    eps = (1.0 + fill * ((n_line + 0.062j) ** 2 - 1.0))[:, None].repeat(1, 8)
+    sim = torcwa.rcwa(freq=1 / WAVELENGTH, order=[12, 0], L=[PERIOD, PERIOD], dtype=torch.complex128, device=torch.device("cpu"))
+    sim.add_input_layer(eps=1.0)
+    sim.add_output_layer(eps=EPS_SI)
+    sim.set_incident_angle(math.radians(15), math.radians(35))
+    sim.add_layer(thickness, eps=eps, factorization=factorization)
+    sim.solve_global_smatrix()
+    return torch.abs(_r00(sim, "pp")) ** 2
+
+
+@pytest.mark.parametrize("factorization", ["laurent", "li_x"])
+def test_gradient_matches_finite_difference(factorization):
+    # Autograd through inv([[1/eps]]) and the eigen-solve, for a material and a geometric parameter (conical).
+    n = torch.tensor(4.497, dtype=torch.float64, requires_grad=True)
+    h = torch.tensor(200e-9, dtype=torch.float64, requires_grad=True)
+    g_n, g_h = torch.autograd.grad(_reflectance_pp(n, h, factorization), (n, h))
+    dn, dh = 1e-6, 1e-13
+    fd_n = (_reflectance_pp(4.497 + dn, 200e-9, factorization) - _reflectance_pp(4.497 - dn, 200e-9, factorization)) / (2 * dn)
+    fd_h = (_reflectance_pp(4.497, 200e-9 + dh, factorization) - _reflectance_pp(4.497, 200e-9 - dh, factorization)) / (2 * dh)
+    assert abs(g_n - fd_n) < 1e-6 * abs(fd_n)
+    assert abs(g_h - fd_h) < 1e-6 * abs(fd_h)
 
 
 def test_two_dimensional_pattern_is_rejected():
